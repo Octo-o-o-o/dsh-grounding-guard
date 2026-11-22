@@ -1,10 +1,17 @@
 /**
  * Official dsh@0.2.2-rc.5 Host entrypoint for `dsh-grounding-guard`.
  *
- * Provides `governanceEvidence` service, passive read/truncation capture + write
- * receipt convergence + memory absolute-wording blocking on `tools/post-execute`,
- * and Stage 1 deterministic + optional Stage 2 fail-closed NLI verification with
- * bounded `agent.steer` self-correction on `agent/turn-stopping`.
+ * - Provides `governanceEvidence` Cordis service.
+ * - Hooks `tools/post-execute` waterfall `(exec, result, next)` strictly honoring
+ *   DSH's `PostToolDecision` (`accept` with `content` / `block` with `feedback` /
+ *   `return next()`).
+ * - Hooks `agent/turn-stopping` serial hook reading real DSH `assistant/message`
+ *   stream/content from `agent.session.snapshotEvents()` (or mock `draft`) and
+ *   steering with a valid DSH `UserMessage` at most `maxSteerCorrections` times.
+ * - Persists verdicts as official ignorable plugin records
+ *   (`plugin:dsh-grounding-guard/evidence-verdict`) via `@deepseek-ai/dsh-session`'s
+ *   `appendPluginRecord()` so session resume & fork never break.
+ * - Exposes authenticated `/api/dshGroundingGuard` matching DSH `serverResponseSchema`.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { containsUnquotedAbsoluteWording, findUnquotedAbsoluteWording } from '../core/absolute-wording.js'
@@ -34,7 +41,8 @@ export * from '../core/quote-verifier.js'
 export * from '../core/write-receipt.js'
 export { runFailClosedNliJudge, type LlmServiceLike } from './nli-judge.js'
 
-export const VERDICT_SESSION_EVENT_TYPE = 'governance/evidence-verdict'
+export const VERDICT_SESSION_EVENT_TYPE = 'plugin:dsh-grounding-guard/evidence-verdict'
+const LEGACY_VERDICT_EVENT_TYPE = 'governance/evidence-verdict'
 
 const DEFAULT_MEMORY_TOOLS = new Set([
   'memory_save',
@@ -59,16 +67,25 @@ const PASSIVE_READ_TOOLS = new Set([
   'get_file',
 ])
 
-interface OptionalAuditService {
-  recordEvent?(input: Record<string, unknown>): unknown
+type AppendPluginRecordFn = (session: unknown, type: string, data: unknown) => unknown
+let cachedAppendPluginRecord: AppendPluginRecordFn | null | undefined
+
+async function resolveAppendPluginRecord(): Promise<AppendPluginRecordFn | null> {
+  if (cachedAppendPluginRecord !== undefined) return cachedAppendPluginRecord
+  try {
+    const specifier = '@deepseek-ai/dsh-session'
+    const mod = (await import(specifier)) as { appendPluginRecord?: AppendPluginRecordFn }
+    cachedAppendPluginRecord = typeof mod.appendPluginRecord === 'function' ? mod.appendPluginRecord : null
+  } catch {
+    cachedAppendPluginRecord = null
+  }
+  return cachedAppendPluginRecord
 }
 
-interface SessionProjectionsLike {
-  register?(def: {
-    readonly key: string
-    readonly initial: () => unknown
-    readonly reduce: (state: any, event: { type?: string; data?: unknown }) => unknown
-  }): () => void
+void resolveAppendPluginRecord()
+
+interface OptionalAuditService {
+  recordEvent?(input: Record<string, unknown>): unknown
 }
 
 interface OfficialHostConnection {
@@ -85,12 +102,74 @@ interface OfficialHostConnection {
 interface CordisLikeContext {
   get(key: string): unknown
   provide?(key: string, value: unknown): void
+  inject?(deps: readonly string[], callback: (ctx: CordisLikeContext) => void): () => void
   on?(event: string, listener: (...args: any[]) => unknown, options?: { prepend?: boolean }): () => void
   effect?(run: () => void | (() => void | Promise<void>), label?: string): void
 }
 
 export const name = 'dsh-grounding-guard'
-export const inject = { optional: ['connection', 'tools', 'sessions', 'sessionProjections', 'llm'] }
+
+function extractTextFromContentBlocks(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return ''
+  const parts: string[] = []
+  for (const b of blocks) {
+    if (typeof b === 'string') parts.push(b)
+    else if (b && typeof b === 'object' && typeof (b as Record<string, unknown>).text === 'string') {
+      parts.push((b as Record<string, unknown>).text as string)
+    }
+  }
+  return parts.join('\n')
+}
+
+function extractTextFromAssistantEventData(data: unknown): string {
+  if (!data || typeof data !== 'object') return ''
+  const d = data as Record<string, unknown>
+
+  // Real DSH `assistant/message` stores `stream: AssistantStreamRecord[]`
+  if (Array.isArray(d.stream)) {
+    const parts: string[] = []
+    for (const rec of d.stream) {
+      if (!rec || typeof rec !== 'object') continue
+      const r = rec as Record<string, unknown>
+      if (r.type === 'text-chunks' && Array.isArray(r.texts)) {
+        for (const t of r.texts) if (typeof t === 'string') parts.push(t)
+      } else if (r.type === 'chunk' && r.chunk && typeof r.chunk === 'object') {
+        const chunk = r.chunk as Record<string, unknown>
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          parts.push(chunk.text)
+        }
+      }
+    }
+    if (parts.length > 0) return parts.join('')
+  }
+
+  // Fallback for content blocks or plain text
+  if (Array.isArray(d.content)) {
+    const t = extractTextFromContentBlocks(d.content)
+    if (t) return t
+  }
+  if (typeof d.text === 'string') return d.text
+  if (typeof d.content === 'string') return d.content
+  return ''
+}
+
+function extractLatestAssistantTextFromSession(session: any): string {
+  if (!session) return ''
+  const events: readonly any[] =
+    typeof session.snapshotEvents === 'function'
+      ? session.snapshotEvents()
+      : Array.isArray(session.events)
+        ? session.events
+        : []
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]
+    if (ev?.type === 'assistant/message') {
+      const text = extractTextFromAssistantEventData(ev.data ?? ev.payload)
+      if (text.trim().length > 0) return text
+    }
+  }
+  return ''
+}
 
 function extractTextFromUnknown(value: unknown, depth = 0): string {
   if (depth > 4 || value === null || value === undefined) return ''
@@ -100,6 +179,14 @@ function extractTextFromUnknown(value: unknown, depth = 0): string {
   }
   if (typeof value === 'object') {
     const obj = value as Record<string, unknown>
+    if (obj.value !== undefined && typeof obj.value === 'object') {
+      const fromVal = extractTextFromUnknown(obj.value, depth + 1)
+      if (fromVal) return fromVal
+    }
+    if (Array.isArray(obj.content)) {
+      const fromBlocks = extractTextFromContentBlocks(obj.content)
+      if (fromBlocks) return fromBlocks
+    }
     for (const k of ['text', 'content', 'draft', 'message', 'body', 'excerpt', 'output', 'note', 'summary']) {
       if (typeof obj[k] === 'string' && (obj[k] as string).length > 0) return obj[k] as string
     }
@@ -108,12 +195,14 @@ function extractTextFromUnknown(value: unknown, depth = 0): string {
   return ''
 }
 
-function resolveSessionId(payload: Record<string, unknown>): { id: string; raw?: any } {
-  const agent = payload?.agent as { session?: { id?: string; append?: (t: string, d: unknown) => unknown } } | undefined
-  const sess = (payload?.session as { id?: string; append?: (t: string, d: unknown) => unknown } | undefined) ?? agent?.session
-  if (sess && typeof sess.id === 'string') return { id: sess.id, raw: sess }
-  if (typeof payload?.sessionId === 'string') return { id: payload.sessionId }
-  return { id: 'default-session' }
+function resolveSessionContext(payload: Record<string, unknown>, boundThis?: unknown): { id: string; raw?: any; agent?: any } {
+  const agent = (payload?.agent ?? (boundThis && typeof boundThis === 'object' && 'session' in (boundThis as object) ? boundThis : undefined)) as
+    | { session?: { id?: string; snapshotEvents?: () => readonly any[]; events?: readonly any[]; append?: (t: string, d: unknown) => unknown }; steer?: (msg: any) => void | Promise<void> }
+    | undefined
+  const sess = (payload?.session as typeof agent extends { session?: infer S } ? S : any) ?? agent?.session
+  if (sess && typeof sess.id === 'string') return { id: sess.id, raw: sess, agent }
+  if (typeof payload?.sessionId === 'string') return { id: payload.sessionId, raw: sess, agent }
+  return { id: 'default-session', raw: sess, agent }
 }
 
 function isMemoryTool(toolName: string, extra?: readonly string[]): boolean {
@@ -139,20 +228,6 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
   const verdictsBySession = new Map<string, TurnVerificationReport[]>()
   const steerCountsByTurn = new Map<string, number>()
 
-  // Register durable projection for honest verdict badges across restarts/forks
-  const projections = ctx.get('sessionProjections') as SessionProjectionsLike | undefined
-  if (projections && typeof projections.register === 'function') {
-    const disposeProj = projections.register({
-      key: 'governanceEvidenceVerdicts',
-      initial: () => [] as TurnVerificationReport[],
-      reduce: (state: TurnVerificationReport[], event) => {
-        if (event?.type !== VERDICT_SESSION_EVENT_TYPE || !event.data) return state
-        return [...state.slice(-99), event.data as TurnVerificationReport]
-      },
-    })
-    ctx.effect?.(() => disposeProj, 'dsh-grounding-guard: projection')
-  }
-
   const recordAudit = (input: Record<string, unknown>) => {
     const audit = ctx.get('governanceAudit') as OptionalAuditService | undefined
     try {
@@ -167,7 +242,6 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
     const contentForHash = input.fullText ?? input.excerpt
     const sha256 = input.sha256 ?? createHash('sha256').update(contentForHash).digest('hex')
 
-    // Avoid duplicate passive captures of identical locator + sha256 + offset
     const existing = list.find(
       (e) =>
         e.locator === input.locator &&
@@ -266,7 +340,6 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
             locator: pair.evidence.locator,
             message: res.reason,
           })
-          // Fail-closed: never retain 'verified' when Stage 2 NLI was requested and failed
           if (verdict === 'verified' || verdict === 'partial') verdict = 'unverified'
         }
       }
@@ -286,17 +359,34 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
     }
   }
 
-  const pushVerdict = (report: TurnVerificationReport, rawSession?: { append?: (t: string, d: unknown) => unknown }) => {
+  const persistVerdictToSession = async (report: TurnVerificationReport, rawSession?: any) => {
+    if (!rawSession) return
+    if (typeof rawSession.snapshotEvents === 'function') {
+      // Real DSH Session -> use ignorable plugin record so persistence always resumes cleanly!
+      const appendFn = (await resolveAppendPluginRecord()) ?? cachedAppendPluginRecord
+      if (typeof appendFn === 'function') {
+        try {
+          appendFn(rawSession, VERDICT_SESSION_EVENT_TYPE, report)
+        } catch {
+          /* ignore detached/closed session */
+        }
+      }
+    } else if (typeof rawSession.append === 'function') {
+      try {
+        rawSession.append(VERDICT_SESSION_EVENT_TYPE, report)
+      } catch {
+        /* ignore mock error */
+      }
+    }
+  }
+
+  const pushVerdict = async (report: TurnVerificationReport, rawSession?: any) => {
     const arr = verdictsBySession.get(report.sessionId) ?? []
     arr.push(report)
     if (arr.length > 100) arr.shift()
     verdictsBySession.set(report.sessionId, arr)
 
-    try {
-      rawSession?.append?.(VERDICT_SESSION_EVENT_TYPE, report)
-    } catch {
-      /* session may be read-only in unit mocks */
-    }
+    await persistVerdictToSession(report, rawSession)
     recordAudit({
       stream: 'governance',
       eventName: 'grounding.turn_verified',
@@ -305,6 +395,7 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
       resourceType: 'session_turn',
       resourceId: report.turnKey,
       outcome: report.verdict === 'contradicted' ? 'denied' : 'success',
+      sessionId: report.sessionId,
       payload: {
         verdict: report.verdict,
         issueCodes: report.issues.map((i) => i.code),
@@ -365,185 +456,274 @@ export function apply(ctx: CordisLikeContext, config: GroundingConfig = {}): Gov
 
   ctx.provide?.('governanceEvidence', service)
 
-  // Hook 1: tools/post-execute (memory absolute wording guard + write receipt convergence + passive evidence capture)
-  const disposePostExec = ctx.on?.('tools/post-execute', (exec: Record<string, unknown>, rawResult: unknown) => {
-    const toolName = String(exec?.toolName ?? exec?.name ?? '')
-    const args = exec?.args ?? exec?.arguments
-    const { id: sessionId } = resolveSessionId(exec)
-
-    // 1a. Block unquoted absolute generalizations on memory-write tools
-    if (enableAbsoluteWordingGuard && isMemoryTool(toolName, config.memoryTools)) {
-      const textToInspect = extractTextFromUnknown(args) || extractTextFromUnknown(rawResult)
-      if (containsUnquotedAbsoluteWording(textToInspect)) {
-        const hits = findUnquotedAbsoluteWording(textToInspect)
-        recordAudit({
-          stream: 'governance',
-          eventName: 'grounding.absolute_wording_blocked',
-          actorType: 'agent',
-          actorId: sessionId,
-          resourceType: 'memory_write',
-          resourceId: toolName,
-          outcome: 'denied',
-          payload: { hits: hits.slice(0, 5) },
-        })
-        return {
-          kind: 'block',
-          reason: `Memory distillation blocked by absoluteWordingGuard (unquoted absolute terms: ${[...new Set(hits)].slice(0, 4).join(', ')}). Drop or cite exact user quote.`,
-        }
+  // Rehydrate persisted verdicts when sessions are resumed/forked
+  const disposeSessCreated = ctx.on?.('session/created', (session: any) => {
+    if (!session || typeof session.id !== 'string') return
+    const events: readonly any[] =
+      typeof session.snapshotEvents === 'function'
+        ? session.snapshotEvents()
+        : Array.isArray(session.events)
+          ? session.events
+          : []
+    const restored: TurnVerificationReport[] = []
+    for (const ev of events) {
+      if ((ev?.type === VERDICT_SESSION_EVENT_TYPE || ev?.type === LEGACY_VERDICT_EVENT_TYPE) && ev.data) {
+        restored.push(ev.data as TurnVerificationReport)
       }
     }
-
-    // 1b. Write-tool receipt convergence (strip raw file body echo)
-    if (enableWriteReceiptFlowback && isWriteReceiptTool(toolName, config.writeTools)) {
-      const alreadyReceipt =
-        rawResult && typeof rawResult === 'object' && (rawResult as Record<string, unknown>).contentKind === 'receipt'
-      if (!alreadyReceipt) {
-        const okFlag =
-          rawResult && typeof rawResult === 'object' && typeof (rawResult as Record<string, unknown>).ok === 'boolean'
-            ? Boolean((rawResult as Record<string, unknown>).ok)
-            : true
-        const receipt = buildWriteReceipt(toolName, rawResult, okFlag, args)
-        return { kind: 'replace', result: receipt }
-      }
-      return undefined
+    if (restored.length > 0) {
+      verdictsBySession.set(session.id, restored.slice(-100))
     }
-
-    // 1c. Passive evidence & truncation capture from read/search tools
-    if (PASSIVE_READ_TOOLS.has(toolName.trim().toLowerCase())) {
-      const resObj = rawResult && typeof rawResult === 'object' ? (rawResult as Record<string, unknown>) : undefined
-      const argsObj = args && typeof args === 'object' ? (args as Record<string, unknown>) : undefined
-      const content = extractTextFromUnknown(rawResult)
-      if (content.length > 0) {
-        const locator = String(
-          resObj?.locator ??
-            resObj?.path ??
-            argsObj?.path ??
-            argsObj?.filePath ??
-            argsObj?.url ??
-            argsObj?.query ??
-            toolName,
-        )
-        const truncated = Boolean(resObj?.truncated)
-        const nextOffset = typeof resObj?.nextOffset === 'number' ? resObj.nextOffset : undefined
-        const sourceType =
-          toolName.includes('web') || toolName.includes('fetch')
-            ? 'web'
-            : toolName.startsWith('kb_')
-              ? 'kb'
-              : 'file'
-        registerEvidence({
-          sessionId,
-          sourceType,
-          locator,
-          excerpt: content.slice(0, 2_000),
-          fullText: content,
-          truncated,
-          nextOffset,
-          bytes: typeof resObj?.bytes === 'number' ? resObj.bytes : Buffer.byteLength(content, 'utf8'),
-        })
-      }
-    }
-    return undefined
   })
 
-  // Hook 2: agent/turn-stopping (Stage 1 deterministic + optional Stage 2 NLI + bounded 1-retry steer)
-  const disposeTurnStop = ctx.on?.('agent/turn-stopping', async (event: Record<string, unknown>) => {
-    const { id: sessionId, raw: rawSession } = resolveSessionId(event)
-    const draftText = extractTextFromUnknown(event?.draft ?? event?.text ?? event?.message ?? event?.response)
+  // Hook 1: Official DSH `tools/post-execute` WATERFALL `(exec, result, next)`
+  const disposePostExec = ctx.on?.(
+    'tools/post-execute',
+    async (exec: Record<string, unknown>, rawResult: unknown, next?: () => Promise<unknown>) => {
+      const toolName = String(exec?.name ?? exec?.toolName ?? '')
+      const args = exec?.arguments ?? exec?.args
+      const { id: sessionId } = resolveSessionContext(exec)
+      const resObj = rawResult && typeof rawResult === 'object' ? (rawResult as Record<string, unknown>) : undefined
+      const payloadObj =
+        resObj && resObj.value && typeof resObj.value === 'object'
+          ? (resObj.value as Record<string, unknown>)
+          : resObj
+
+      // 1a. Block unquoted absolute generalizations on memory-write tools
+      if (enableAbsoluteWordingGuard && isMemoryTool(toolName, config.memoryTools)) {
+        const textToInspect = extractTextFromUnknown(args) || extractTextFromUnknown(rawResult)
+        if (containsUnquotedAbsoluteWording(textToInspect)) {
+          const hits = findUnquotedAbsoluteWording(textToInspect)
+          const reason = `Memory distillation blocked by absoluteWordingGuard (unquoted absolute terms: ${[...new Set(hits)].slice(0, 4).join(', ')}). Drop or cite exact user quote.`
+          recordAudit({
+            stream: 'governance',
+            eventName: 'grounding.absolute_wording_blocked',
+            actorType: 'agent',
+            actorId: sessionId,
+            resourceType: 'memory_write',
+            resourceId: toolName,
+            outcome: 'denied',
+            sessionId,
+            payload: { hits: hits.slice(0, 5) },
+          })
+          return {
+            kind: 'block',
+            feedback: [{ type: 'text', text: reason }],
+            info: {
+              name: 'AbsoluteWordingBlockedError',
+              code: 'ABSOLUTE_WORDING_BLOCKED',
+              reason,
+            },
+          }
+        }
+      }
+
+      // 1b. Write-tool receipt convergence (DSH `accept` with compact receipt ContentBlock, stripping raw body echo)
+      if (enableWriteReceiptFlowback && isWriteReceiptTool(toolName, config.writeTools)) {
+        const alreadyReceipt = payloadObj?.contentKind === 'receipt'
+        if (!alreadyReceipt) {
+          const okFlag =
+            typeof resObj?.isError === 'boolean'
+              ? !resObj.isError
+              : typeof payloadObj?.ok === 'boolean'
+                ? Boolean(payloadObj.ok)
+                : true
+          const receipt = buildWriteReceipt(toolName, payloadObj ?? rawResult, okFlag, args)
+          return {
+            kind: 'accept',
+            content: [{ type: 'text', text: JSON.stringify(receipt) }],
+          }
+        }
+      }
+
+      // 1c. Passive evidence & truncation capture from read/search tools
+      if (PASSIVE_READ_TOOLS.has(toolName.trim().toLowerCase()) && !resObj?.isError) {
+        const argsObj = args && typeof args === 'object' ? (args as Record<string, unknown>) : undefined
+        const content = extractTextFromUnknown(payloadObj ?? rawResult)
+        if (content.length > 0) {
+          const locator = String(
+            payloadObj?.locator ??
+              payloadObj?.relPath ??
+              payloadObj?.path ??
+              argsObj?.path ??
+              argsObj?.filePath ??
+              argsObj?.url ??
+              argsObj?.query ??
+              toolName,
+          )
+          const truncated = Boolean(payloadObj?.truncated)
+          const nextOffset = typeof payloadObj?.nextOffset === 'number' ? payloadObj.nextOffset : undefined
+          const sourceType =
+            toolName.includes('web') || toolName.includes('fetch')
+              ? 'web'
+              : toolName.startsWith('kb_')
+                ? 'kb'
+                : 'file'
+          registerEvidence({
+            sessionId,
+            sourceType,
+            locator,
+            excerpt: content.slice(0, 2_000),
+            fullText: content,
+            truncated,
+            nextOffset,
+            bytes: typeof payloadObj?.bytes === 'number' ? payloadObj.bytes : Buffer.byteLength(content, 'utf8'),
+          })
+        }
+      }
+
+      // CRITICAL: always continue DSH waterfall when not intercepting!
+      return typeof next === 'function' ? next() : { kind: 'accept' }
+    },
+  )
+
+  // Hook 2: Official DSH `agent/turn-stopping` serial hook (`function(this: Agent, { agent, turn, signal })`)
+  const disposeTurnStop = ctx.on?.('agent/turn-stopping', async function (this: unknown, event: Record<string, unknown>) {
+    const { id: sessionId, raw: rawSession, agent } = resolveSessionContext(event ?? {}, this)
+    const draftText =
+      extractTextFromUnknown(event?.draft ?? event?.text ?? event?.message ?? event?.response) ||
+      extractLatestAssistantTextFromSession(rawSession)
     if (!draftText.trim()) return undefined
 
-    const turnKey = String(event?.turnId ?? event?.turnKey ?? `${sessionId}:turn-${event?.turnIndex ?? 0}`)
+    const turnNumber = typeof event?.turn === 'number' ? event.turn : event?.turnIndex ?? 0
+    const turnKey = String(event?.turnId ?? event?.turnKey ?? `${sessionId}:turn-${turnNumber}`)
     const report = await verifyTurnTextInternal(sessionId, draftText, { turnKey })
 
     const blockingIssues = report.issues.filter((i) => i.severity === 'error')
     const currentSteers = steerCountsByTurn.get(turnKey) ?? 0
-    const agent = event?.agent as { steer?: (instruction: string) => void | Promise<void> } | undefined
 
-    if (mode === 'enforce' && blockingIssues.length > 0 && currentSteers < maxSteerCorrections && typeof agent?.steer === 'function') {
+    if (
+      mode === 'enforce' &&
+      blockingIssues.length > 0 &&
+      currentSteers < maxSteerCorrections &&
+      typeof agent?.steer === 'function'
+    ) {
       steerCountsByTurn.set(turnKey, currentSteers + 1)
       const steeredReport: TurnVerificationReport = { ...report, steered: true }
-      pushVerdict(steeredReport, rawSession)
+      await pushVerdict(steeredReport, rawSession)
       const reasons = blockingIssues.map((i) => `- [${i.code}] ${i.message}`).join('\n')
-      await agent.steer(
-        `[dsh-grounding-guard] Grounding verification failed (${blockingIssues.length} issue(s)). Fix the response using only verified evidence or state uncertainty explicitly:\n${reasons}`,
-      )
+      const correctionText = `[dsh-grounding-guard] Grounding verification failed (${blockingIssues.length} issue(s)). Fix the response using only verified evidence or state uncertainty explicitly:\n${reasons}`
+      // Official DSH `Agent.steer(UserMessage)` contract!
+      await agent.steer({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: correctionText }],
+        source: { kind: 'user' },
+      })
       return steeredReport
     }
 
-    pushVerdict(report, rawSession)
+    await pushVerdict(report, rawSession)
     return report
   })
 
-  // Authenticated Host RPC: /api/dshGroundingGuard
-  const connection = ctx.get('connection') as OfficialHostConnection | undefined
+  // Authenticated Host RPC: /api/dshGroundingGuard (matches official DSH Connection RPC envelope)
   let disposeRoute: (() => Promise<void> | void) | undefined
-  if (connection?.fetch?.register) {
-    disposeRoute = connection.fetch.register({
+  const registerConnectionRoute = (connection: OfficialHostConnection): (() => Promise<void> | void) | undefined => {
+    if (!connection?.fetch?.register) return undefined
+    return connection.fetch.register({
       path: '/api/dshGroundingGuard',
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: async (request: Request) => {
-        const body = (await request.json().catch(() => ({}))) as {
-          rpcId?: string
-          method?: string
-          payload?: Record<string, unknown>
-        }
-        const rpcId = body.rpcId ?? ''
-        const method = body.method ?? 'status'
-        const payload = body.payload ?? {}
-
+        let body: Record<string, unknown>
         try {
-          let result: unknown
-          if (method === 'status') {
-            result = {
-              config: service.getConfig(),
-              evidenceCount: service.listEvidence().length,
-              verdictCount: service.listVerdicts().length,
-            }
-          } else if (method === 'listEvidence') {
-            result = {
-              items: service.listEvidence(typeof payload.sessionId === 'string' ? payload.sessionId : undefined),
-            }
-          } else if (method === 'listVerdicts') {
-            result = {
-              items: service.listVerdicts(typeof payload.sessionId === 'string' ? payload.sessionId : undefined).slice(-50).reverse(),
-            }
-          } else if (method === 'setNliEnabled') {
-            service.setNliEnabled(Boolean(payload.enabled))
-            result = { config: service.getConfig() }
-          } else if (method === 'setMode') {
-            const next = payload.mode === 'observe' ? 'observe' : 'enforce'
-            service.setMode(next)
-            result = { config: service.getConfig() }
-          } else if (method === 'verifyText') {
-            const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : 'default-session'
-            const text = typeof payload.text === 'string' ? payload.text : ''
-            result = await service.verifyTurnText(sessionId, text, {
-              runNli: typeof payload.runNli === 'boolean' ? payload.runNli : undefined,
-            })
-          } else {
-            return Response.json(
-              { type: 'server-response', rpcId, error: { code: 'UNKNOWN_METHOD', message: `Unknown method: ${method}` } },
-              { status: 400 },
-            )
-          }
-          return Response.json({ type: 'server-response', rpcId, result })
-        } catch (err) {
-          return Response.json(
-            {
-              type: 'server-response',
-              rpcId,
-              error: { code: 'INTERNAL_ERROR', message: err instanceof Error ? err.message : String(err) },
-            },
-            { status: 500 },
-          )
+          body = (await request.json()) as Record<string, unknown>
+        } catch {
+          return new Response('body is not JSON', { status: 400 })
         }
+        const rpcId = typeof body?.rpcId === 'string' ? body.rpcId : '00000000-0000-0000-0000-000000000000'
+        const isDshEnvelope = body?.type === 'client-request' && body?.payload && typeof body.payload === 'object'
+        const envelope = (isDshEnvelope ? body.payload : body) as { method?: unknown; payload?: Record<string, unknown> }
+        const method = typeof envelope.method === 'string' ? envelope.method : 'status'
+        const payload = (envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : {}) as Record<string, unknown>
+
+        const dispatch = async (): Promise<
+          { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: { readonly code: string; readonly message: string; readonly details: object } }
+        > => {
+          try {
+            if (method === 'status') {
+              return {
+                ok: true,
+                value: {
+                  config: service.getConfig(),
+                  evidenceCount: service.listEvidence().length,
+                  verdictCount: service.listVerdicts().length,
+                },
+              }
+            }
+            if (method === 'listEvidence') {
+              return {
+                ok: true,
+                value: {
+                  items: service.listEvidence(typeof payload.sessionId === 'string' ? payload.sessionId : undefined),
+                },
+              }
+            }
+            if (method === 'listVerdicts') {
+              return {
+                ok: true,
+                value: {
+                  items: service
+                    .listVerdicts(typeof payload.sessionId === 'string' ? payload.sessionId : undefined)
+                    .slice(-50)
+                    .reverse(),
+                },
+              }
+            }
+            if (method === 'setNliEnabled') {
+              service.setNliEnabled(Boolean(payload.enabled))
+              return { ok: true, value: { config: service.getConfig() } }
+            }
+            if (method === 'setMode') {
+              const next = payload.mode === 'observe' ? 'observe' : 'enforce'
+              service.setMode(next)
+              return { ok: true, value: { config: service.getConfig() } }
+            }
+            if (method === 'verifyText') {
+              const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : 'default-session'
+              const text = typeof payload.text === 'string' ? payload.text : ''
+              const verified = await service.verifyTurnText(sessionId, text, {
+                runNli: typeof payload.runNli === 'boolean' ? payload.runNli : undefined,
+              })
+              return { ok: true, value: verified }
+            }
+            return {
+              ok: false,
+              error: { code: 'dsh-grounding-guard/not-found', message: `Unknown method: ${method}`, details: {} },
+            }
+          } catch (err) {
+            return {
+              ok: false,
+              error: {
+                code: 'dsh-grounding-guard/error',
+                message: err instanceof Error ? err.message : String(err),
+                details: {},
+              },
+            }
+          }
+        }
+
+        return Response.json({ type: 'server-response', rpcId, result: await dispatch() })
       },
     })
   }
 
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['connection'], (scope) => {
+      const conn = scope.get('connection') as OfficialHostConnection | undefined
+      if (!conn) return
+      const disposer = registerConnectionRoute(conn)
+      if (disposer) scope.effect?.(() => disposer, 'dsh-grounding-guard: connection route')
+    })
+  } else {
+    const conn = ctx.get('connection') as OfficialHostConnection | undefined
+    if (conn) disposeRoute = registerConnectionRoute(conn)
+  }
+
   ctx.effect?.(() => {
     return async () => {
+      disposeSessCreated?.()
       disposePostExec?.()
       disposeTurnStop?.()
       await disposeRoute?.()

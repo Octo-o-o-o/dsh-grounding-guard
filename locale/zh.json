@@ -1,5 +1,7 @@
 {
-  "name": "dsh-grounding-guard",
-  "displayName": "证据护栏与反幻觉",
-  "description": "面向 DeepSeek Harness 的确定性证据校验、反向引文定位、截断断言拦截、answerBlocks 零自填数值、写入回执收敛与可选独立 NLI 复核插件。"
+  "meta": {
+    "title": "证据护栏与反幻觉",
+    "description": "确定性证据总线、反向引文定位、截断读全称断言拦截、answerBlocks 零自填数值、写入回执收敛与可选独立 NLI 复核插件。",
+    "detail": "./README.md"
+  }
 }

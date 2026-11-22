@@ -15,13 +15,14 @@
   - **宿主机物证校验 (`verifyArtifact`)**：使用 `lstat` + `realpath` + `O_NOFOLLOW` + 前后 `fstat` 竞态检查与 SHA-256 / RFC-4180 CSV 列和校验，不轻信执行器自述。
   - **记忆绝对化措辞护栏 (`absoluteWordingGuard`)**：拦截未豁免（非引号原话、非否定式）的“总是 / 从不 / 一定 / always / never / expert”过度概括写入记忆。
   - **写入回执收敛 (`WriteReceipt`)**：在 `tools/post-execute` 将写文件类工具输出收敛为仅含路径、字节数、状态与 SHA-256 的紧凑回执（`contentKind: 'receipt'`），去除原始正文回流以降低上下文污染与幻觉。
-- **有界自纠与持久化诚实结论**：在 `agent/turn-stopping` 钩子中执行校验；命中阻断问题时最多调用 `1` 次 `agent.steer(...)` 要求模型纠偏（绝不死循环），并将最终 `verified` / `partial` / `unverified` / `contradicted` 写入 log-only `governance/evidence-verdict` 会话事件。
+- **有界自纠与持久化诚实结论**：在 `agent/turn-stopping` 钩子中执行校验；命中阻断问题时最多调用 `1` 次 `agent.steer(UserMessage)` 要求模型纠偏（绝不死循环），并将最终 `verified` / `partial` / `unverified` / `contradicted` 以 `ignorable: true` 插件事件（`plugin:dsh-grounding-guard/evidence-verdict`）持久化到会话日志。
 - **Stage 2 独立 NLI 复核（默认关闭，按需开启）**：通过 `ctx.llm` 使用独立 purpose `'grounding-verify'`，将待验句与引文装入不可信 JSON 数据边界；发生超时、格式错误或模型不可用时一律 **fail-closed 降级为 `unverified`**。
 
 ## 安装
 
 ```bash
-dsh plugin add github:Octo-o-o-o/dsh-grounding-guard
+dsh plugin --profile web add github:Octo-o-o-o/dsh-grounding-guard
+dsh web
 ```
 
 ## 诚实边界说明

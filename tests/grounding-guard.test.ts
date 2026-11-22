@@ -106,46 +106,49 @@ describe('dsh-grounding-guard', () => {
     const postExec = listeners.get('tools/post-execute')![0]!
     const turnStop = listeners.get('agent/turn-stopping')![0]!
 
-    // Passive capture of truncated read
-    postExec(
-      { toolName: 'read_file', sessionId: 'sess-trunc', args: { path: 'big.log' } },
-      { text: 'line 1\nline 2\n', truncated: true, nextOffset: 4096 },
+    // Passive capture of truncated read (DSH waterfall `(exec, result, next)`)
+    const nextRes = await postExec(
+      { name: 'read_file', sessionId: 'sess-trunc', arguments: { path: 'big.log' } },
+      { isError: false, value: { text: 'line 1\nline 2\n', truncated: true, nextOffset: 4096 }, content: [{ type: 'text', text: 'line 1\nline 2\n' }] },
+      async () => ({ kind: 'accept' }),
     )
+    expect(nextRes.kind).toBe('accept')
 
-    const steerCalls: string[] = []
+    const steerCalls: any[] = []
     const sessionEvents: { type: string; data: unknown }[] = []
     const mockEvent = {
       sessionId: 'sess-trunc',
-      turnId: 'turn-42',
+      turn: 42,
       session: {
         id: 'sess-trunc',
         append: (type: string, data: unknown) => sessionEvents.push({ type, data }),
       },
       agent: {
-        steer: (msg: string) => steerCalls.push(msg),
+        steer: (msg: any) => steerCalls.push(msg),
       },
       draft: '经核查，全文未找到任何错误记录。',
     }
 
-    // Attempt 1 -> triggers 1 steer correction
+    // Attempt 1 -> triggers 1 steer correction with official DSH UserMessage shape
     const first = await turnStop(mockEvent)
     expect(first.verdict).toBe('contradicted')
     expect(first.steered).toBe(true)
     expect(steerCalls).toHaveLength(1)
-    expect(steerCalls[0]).toContain('TRUNCATED_EXHAUSTIVE_CLAIM')
+    expect(steerCalls[0].role).toBe('user')
+    expect(steerCalls[0].content[0].text).toContain('TRUNCATED_EXHAUSTIVE_CLAIM')
 
-    // Attempt 2 on same turnId -> MUST NOT loop infinitely; persists honest verdict
+    // Attempt 2 on same turn -> MUST NOT loop infinitely; persists honest verdict
     const second = await turnStop(mockEvent)
     expect(second.verdict).toBe('contradicted')
     expect(second.steered).toBe(false)
     expect(steerCalls).toHaveLength(1)
     expect(sessionEvents).toHaveLength(2)
-    expect(sessionEvents[0]!.type).toBe('governance/evidence-verdict')
+    expect(sessionEvents[0]!.type).toBe('plugin:dsh-grounding-guard/evidence-verdict')
 
     // Honest partial acknowledgment passes without truncation error
     const third = await turnStop({
       ...mockEvent,
-      turnId: 'turn-43',
+      turn: 43,
       draft: '注意：该文件读取已截断（仅读取前 4096 字节），在已读片段中未见错误记录。',
     })
     expect(third.issues.some((i: { code: string }) => i.code === 'TRUNCATED_EXHAUSTIVE_CLAIM')).toBe(false)
@@ -203,26 +206,49 @@ describe('dsh-grounding-guard', () => {
     expect(verifyAndRenderAnswerBlocks(badRow, views).ok).toBe(false)
   })
 
-  it('converges write-tool outputs into compact WriteReceipts without body echo', () => {
-    const { ctx, listeners } = createMockCtx()
+  it('converges write-tool outputs into compact WriteReceipts via DSH PostToolDecision accept/content', async () => {
+    const { ctx, listeners, routes } = createMockCtx()
     apply(ctx)
     const postExec = listeners.get('tools/post-execute')![0]!
 
-    const out = postExec(
+    const out = await postExec(
       {
-        toolName: 'write_file',
+        name: 'write_file',
         sessionId: 's-w',
-        args: { path: 'C:\\Users\\alice\\project\\report.md', content: 'TOP SECRET BODY sk-1234567890abcdef' },
+        arguments: { path: 'C:\\Users\\alice\\project\\report.md', content: 'TOP SECRET BODY sk-1234567890abcdef' },
       },
-      { ok: true, bytes: 36, created: true, content: 'TOP SECRET BODY sk-1234567890abcdef' },
+      { isError: false, value: { ok: true, bytes: 36, created: true, content: 'TOP SECRET BODY sk-1234567890abcdef' }, content: [] },
+      async () => ({ kind: 'accept' }),
     )
-    expect(out?.kind).toBe('replace')
-    expect(out.result.contentKind).toBe('receipt')
-    expect(out.result.metrics.bytes).toBe(36)
-    expect(out.result.states.created).toBe(true)
-    expect(out.result.sha256).toHaveLength(64)
-    expect(JSON.stringify(out.result)).not.toContain('TOP SECRET BODY')
-    expect(JSON.stringify(out.result)).not.toContain('alice')
+    expect(out?.kind).toBe('accept')
+    expect(Array.isArray(out.content)).toBe(true)
+    const receipt = JSON.parse(out.content[0].text)
+    expect(receipt.contentKind).toBe('receipt')
+    expect(receipt.metrics.bytes).toBe(36)
+    expect(receipt.states.created).toBe(true)
+    expect(receipt.sha256).toHaveLength(64)
+    expect(out.content[0].text).not.toContain('TOP SECRET BODY')
+    expect(out.content[0].text).not.toContain('alice')
+
+    // Verify official DSH Connection RPC envelope (`/api/dshGroundingGuard`)
+    const handler = routes.get('/api/dshGroundingGuard')!
+    const resp = await handler(
+      new Request('http://127.0.0.1/api/dshGroundingGuard', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'rpc-1',
+          method: 'dshGroundingGuard',
+          payload: { method: 'status', payload: {} },
+        }),
+      }),
+    )
+    const json = (await resp.json()) as any
+    expect(json.type).toBe('server-response')
+    expect(json.rpcId).toBe('rpc-1')
+    expect(json.result.ok).toBe(true)
+    expect(json.result.value.config.enableNliStage2).toBe(false)
   })
 
   it('verifies host physical artifacts (SHA-256 + strict CSV sums) and blocks path traversal', () => {
@@ -260,7 +286,7 @@ describe('dsh-grounding-guard', () => {
     expect(escape.reason).toBe('ARTIFACT_PATH_ESCAPE')
   })
 
-  it('enforces absoluteWordingGuard with quote/negation exemptions and blocks memory writes', () => {
+  it('enforces absoluteWordingGuard with quote/negation exemptions and blocks memory writes', async () => {
     expect(containsUnquotedAbsoluteWording('用户总是喜欢深色模式')).toBe(true)
     expect(containsUnquotedAbsoluteWording('User is an expert in Rust')).toBe(true)
     expect(containsUnquotedAbsoluteWording('用户说“我总是用深色模式”')).toBe(false)
@@ -270,11 +296,14 @@ describe('dsh-grounding-guard', () => {
     const { ctx, listeners } = createMockCtx()
     apply(ctx)
     const postExec = listeners.get('tools/post-execute')![0]!
-    const blocked = postExec(
-      { toolName: 'memory_save', sessionId: 's-m', args: { content: '用户一定拒绝所有英文文档' } },
-      { ok: true },
+    const blocked = await postExec(
+      { name: 'memory_save', sessionId: 's-m', arguments: { content: '用户一定拒绝所有英文文档' } },
+      { isError: false, value: { ok: true }, content: [] },
+      async () => ({ kind: 'accept' }),
     )
     expect(blocked?.kind).toBe('block')
+    expect(Array.isArray(blocked.feedback)).toBe(true)
+    expect(blocked.info?.code).toBe('ABSOLUTE_WORDING_BLOCKED')
   })
 
   it('fails closed to unverified when Stage 2 NLI judge errors or is unavailable', async () => {
@@ -298,5 +327,52 @@ describe('dsh-grounding-guard', () => {
     // Stage 1 would have passed, but Stage 2 NLI failed -> MUST fail-closed to unverified!
     expect(rep.verdict).toBe('unverified')
     expect(rep.issues.some((i) => i.code === 'NLI_UNAVAILABLE')).toBe(true)
+  })
+
+  it('supports real DSH session.snapshotEvents() assistant stream & ctx.llm.stream NLI', async () => {
+    const streamLlm = {
+      async *stream() {
+        yield { type: 'text-delta', text: '{"verdict":"contradicted","reason":"Numbers disagree"}' }
+        yield { type: 'finish', reason: 'stop' }
+      },
+    }
+    const { ctx, listeners } = createMockCtx({ llm: streamLlm })
+    const svc = apply(ctx, { enableNliStage2: true })
+    const ev = svc.registerEvidence({
+      sessionId: 's-dsh-real',
+      sourceType: 'file',
+      locator: 'budget.md',
+      excerpt: 'Approved cap is 100k USD.',
+      fullText: 'Approved cap is 100k USD.',
+    })
+
+    const turnStop = listeners.get('agent/turn-stopping')![0]!
+    const steeredMsgs: any[] = []
+    const realSessionShape = {
+      id: 's-dsh-real',
+      snapshotEvents: () => [
+        {
+          type: 'assistant/message',
+          data: {
+            stream: [
+              { type: 'text-chunks', texts: [`The cap is 500k USD [ev:${ev.id}].`] },
+            ],
+          },
+        },
+      ],
+    }
+
+    const rep = await turnStop({
+      turn: 1,
+      agent: {
+        session: realSessionShape,
+        steer: (msg: any) => steeredMsgs.push(msg),
+      },
+    })
+    expect(rep.nliUsed).toBe(true)
+    expect(rep.verdict).toBe('contradicted')
+    expect(rep.steered).toBe(true)
+    expect(steeredMsgs[0].role).toBe('user')
+    expect(steeredMsgs[0].source.kind).toBe('user')
   })
 })

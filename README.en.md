@@ -15,13 +15,14 @@ Deterministic anti-hallucination, evidence bus, reverse quote locator, zero-auth
   - Host-side artifact verifier (`realpath` + `lstat` + `O_NOFOLLOW` + pre/post `fstat` race detection + SHA-256 + RFC-4180 CSV schema/sum check).
   - Unquoted absolute wording guard for memory distillation writes (with quote and negation exemptions).
   - Write-tool receipt convergence (`contentKind: 'receipt'`, stripping raw body echo).
-- **Bounded Self-Correction (`agent/turn-stopping`)**: Calls `agent.steer(...)` at most `maxSteerCorrections` (default `1`) times on blocking evidence failures, and persists durable `governance/evidence-verdict` log-only SessionEvents (`verified` / `partial` / `unverified` / `contradicted`).
+- **Bounded Self-Correction (`agent/turn-stopping`)**: Calls `agent.steer(UserMessage)` at most `maxSteerCorrections` (default `1`) times on blocking evidence failures, and persists durable `ignorable: true` plugin records (`plugin:dsh-grounding-guard/evidence-verdict`) with honest verdicts (`verified` / `partial` / `unverified` / `contradicted`).
 - **Optional Stage 2 NLI Judge (Default Off, Fail-Closed)**: Calls `ctx.llm` under isolated purpose `'grounding-verify'` treating sentence & quote strictly as untrusted JSON data; fails closed to `unverified` on any error or timeout.
 
 ## Install
 
 ```bash
-dsh plugin add github:Octo-o-o-o/dsh-grounding-guard
+dsh plugin --profile web add github:Octo-o-o-o/dsh-grounding-guard
+dsh web
 ```
 
 ## Honest Boundaries
