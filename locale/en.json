@@ -1,0 +1,5 @@
+{
+  "name": "dsh-grounding-guard",
+  "displayName": "Grounding Guard",
+  "description": "Deterministic evidence verification, reverse quote locator, truncated-read assertion guard, zero-authored-numbers answerBlocks validator, write-receipt convergence, and optional fail-closed NLI judge for DeepSeek Harness."
+}

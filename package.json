@@ -1,0 +1,102 @@
+{
+  "name": "dsh-grounding-guard",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Deterministic anti-hallucination, evidence bus, reverse quote locator, structured answerBlocks validator, write-receipt convergence, and optional fail-closed NLI verification for DeepSeek Harness (dsh@0.2.2-rc.5).",
+  "icon": "./icon.svg",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "grounding",
+    "anti-hallucination",
+    "citation",
+    "verification",
+    "evidence",
+    "governance"
+  ],
+  "author": "OctoLab (Octo-o-o-o)",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Octo-o-o-o/dsh-grounding-guard",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Octo-o-o-o/dsh-grounding-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Octo-o-o-o/dsh-grounding-guard/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.9",
+    "dsh": ">=0.2.2-rc.5 <0.3.0"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "lib",
+    "locale/*.json",
+    "skills",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "external": [
+        "react",
+        "react/jsx-runtime",
+        "react-dom",
+        "@deepseek-ai/cordis",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "react": "^18.3.1"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "esbuild": "0.28.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "5.9.3",
+    "vitest": "5.1.1",
+    "yaml": "^2.8.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify:release": "node scripts/verify-release.mjs"
+  }
+}
